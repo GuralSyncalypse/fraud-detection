@@ -1,0 +1,13 @@
+.git
+.env
+.venv
+__pycache__/
+*.py[cod]
+*.log
+
+# Runtime inputs/outputs are bind-mounted and must not bloat the image context.
+data/
+notebooks/
+output/
+scripts/
+

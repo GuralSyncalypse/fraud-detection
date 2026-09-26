@@ -1,0 +1,8 @@
+# Phase 1: notebook environment. Data-science dependencies are pinned here so
+# every student builds the same image; later phases may extend this list.
+jupyterlab==4.3.6
+ipykernel==6.29.5
+pandas==2.2.3
+matplotlib==3.10.0
+scikit-learn==1.6.1
+

@@ -1,0 +1,200 @@
+name: financial-fraud-detection
+
+x-hadoop-common: &hadoop-common
+  build:
+    context: .
+    dockerfile: docker/hadoop/Dockerfile
+  image: financial-fraud/hadoop:3.4.3
+  restart: unless-stopped
+  networks:
+    - fraud-network
+
+x-spark-common: &spark-common
+  build:
+    context: .
+    dockerfile: docker/spark/Dockerfile
+  image: financial-fraud/spark-jupyter:3.5.9
+  restart: unless-stopped
+  networks:
+    - fraud-network
+
+services:
+  namenode:
+    <<: *hadoop-common
+    hostname: namenode
+    command: ["/opt/project/start-namenode.sh"]
+    ports:
+      - "9870:9870"
+      - "8020:8020"
+    volumes:
+      - namenode-data:/data/name
+      - ./data:/workspace/data:ro
+    healthcheck:
+      test: ["CMD-SHELL", "hdfs dfsadmin -fs hdfs://namenode:8020 -safemode get >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 20s
+
+  datanode-1:
+    <<: *hadoop-common
+    hostname: datanode-1
+    command: ["/opt/project/start-datanode.sh"]
+    depends_on:
+      namenode:
+        condition: service_healthy
+    ports:
+      - "9864:9864"
+    volumes:
+      - datanode-1-data:/data/data
+    healthcheck:
+      test: ["CMD-SHELL", "hdfs dfsadmin -fs hdfs://namenode:8020 -report 2>/dev/null | grep -q 'Name:.*datanode-1'"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 20s
+
+  datanode-2:
+    <<: *hadoop-common
+    hostname: datanode-2
+    command: ["/opt/project/start-datanode.sh"]
+    depends_on:
+      namenode:
+        condition: service_healthy
+    ports:
+      - "9865:9864"
+    volumes:
+      - datanode-2-data:/data/data
+    healthcheck:
+      test: ["CMD-SHELL", "hdfs dfsadmin -fs hdfs://namenode:8020 -report 2>/dev/null | grep -q 'Name:.*datanode-2'"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 20s
+
+  spark-master:
+    <<: *spark-common
+    hostname: spark-master
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+      - --port
+      - "7077"
+      - --webui-port
+      - "8080"
+    ports:
+      - "7077:7077"
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/spark-master/7077'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  spark-worker-1:
+    <<: *spark-common
+    hostname: spark-worker-1
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - --webui-port
+      - "8081"
+      - --cores
+      - "2"
+      - --memory
+      - 1g
+      - spark://spark-master:7077
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8081'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  spark-worker-2:
+    <<: *spark-common
+    hostname: spark-worker-2
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - --webui-port
+      - "8081"
+      - --cores
+      - "2"
+      - --memory
+      - 1g
+      - spark://spark-master:7077
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    ports:
+      - "8082:8081"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8081'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  jupyter:
+    <<: *spark-common
+    hostname: jupyter
+    command: ["/opt/project/start-jupyter.sh"]
+    environment:
+      JUPYTER_TOKEN: ${JUPYTER_TOKEN:-fraud-demo}
+      SPARK_MASTER_URL: spark://spark-master:7077
+      HDFS_URL: hdfs://namenode:8020
+      PYSPARK_SUBMIT_ARGS: >-
+        --master spark://spark-master:7077
+        --conf spark.driver.host=jupyter
+        --conf spark.driver.bindAddress=0.0.0.0
+        pyspark-shell
+    depends_on:
+      namenode:
+        condition: service_healthy
+      datanode-1:
+        condition: service_healthy
+      datanode-2:
+        condition: service_healthy
+      spark-master:
+        condition: service_healthy
+      spark-worker-1:
+        condition: service_healthy
+      spark-worker-2:
+        condition: service_healthy
+    ports:
+      - "8888:8888"
+      - "4040:4040"
+    volumes:
+      - ./notebooks:/workspace/notebooks
+      - ./data:/workspace/data
+      - ./output:/workspace/output
+      - ./scripts:/workspace/scripts:ro
+      - ./src:/workspace/src:ro
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8888/api', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 20s
+
+networks:
+  fraud-network:
+    name: financial-fraud-network
+    driver: bridge
+
+volumes:
+  namenode-data:
+    name: financial-fraud-namenode-data
+  datanode-1-data:
+    name: financial-fraud-datanode-1-data
+  datanode-2-data:
+    name: financial-fraud-datanode-2-data
