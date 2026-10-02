@@ -6,9 +6,10 @@ import argparse
 import csv
 import json
 import os
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from pyspark.ml.classification import (
     LogisticRegressionModel,
@@ -17,6 +18,7 @@ from pyspark.ml.classification import (
 from pyspark.ml.functions import vector_to_array
 from pyspark.ml.pipeline import PipelineModel
 from pyspark.sql import DataFrame, SparkSession, functions as F, types as T
+from pyspark.sql.utils import AnalysisException
 
 from feature_engineering import prepare_inference_features
 
@@ -25,6 +27,7 @@ DEFAULT_INPUT = "hdfs:///financial/raw/new_transactions.csv"
 DEFAULT_OUTPUT = "hdfs:///financial/predictions/new_transactions"
 DEFAULT_MODEL_BASE = "hdfs:///financial/models"
 DEFAULT_MODEL = "rf_undersampling"
+DEFAULT_THRESHOLD = 0.5
 DEFAULT_REPORT = "/workspace/output/results/new_prediction_summary.json"
 DEFAULT_CSV = "/workspace/output/results/new_transactions_predictions.csv"
 
@@ -75,6 +78,8 @@ def read_and_validate_new_transactions(
         F.col("transaction_id").isNull()
         | F.col("transaction_time").isNull()
         | F.col("amount").isNull()
+        | F.isnan(F.col("amount"))
+        | (F.col("amount") < 0)
         | F.col("mcc").isNull()
     ).count()
     if invalid:
@@ -90,8 +95,18 @@ def read_and_validate_new_transactions(
     return parsed
 
 
+def read_phase4_selection(spark: SparkSession, model_base: str) -> dict[str, Any]:
+    """Load validation-based defaults; keep old artifacts usable."""
+    try:
+        rows = spark.read.text(f"{model_base}/metadata/phase4_summary.json").collect()
+    except AnalysisException:
+        return {}
+    payload = json.loads("\n".join(row["value"] for row in rows))
+    return payload.get("selection", {})
+
+
 def write_local_outputs(
-    rows: list[Any], report: dict[str, Any], csv_path: str, report_path: str
+    rows: Iterable[Any], report: dict[str, Any], csv_path: str, report_path: str
 ) -> None:
     csv_destination = Path(csv_path)
     csv_destination.parent.mkdir(parents=True, exist_ok=True)
@@ -145,17 +160,31 @@ def run_prediction(
     input_path: str,
     output_path: str,
     model_base: str,
-    model_slug: str,
-    threshold: float,
+    model_slug: str | None,
+    threshold: float | None,
     report_path: str,
     csv_path: str,
 ) -> dict[str, Any]:
+    selection = read_phase4_selection(spark, model_base)
+    model_slug = model_slug or selection.get("recommended_model", DEFAULT_MODEL)
+    if threshold is None:
+        threshold = float(
+            selection.get("thresholds_by_model", {}).get(model_slug, DEFAULT_THRESHOLD)
+        )
     if model_slug not in MODEL_LOADERS:
         raise ValueError(f"Unknown model {model_slug}; choose from {sorted(MODEL_LOADERS)}")
     if not 0.0 <= threshold <= 1.0:
         raise ValueError("threshold must be in [0, 1]")
 
-    raw = read_and_validate_new_transactions(spark, input_path)
+    resolved_input_path = input_path
+    if not input_path.startswith(("hdfs://", "viewfs://")):
+        resolved_input_path = f"hdfs:///financial/raw/dashboard_upload_{uuid.uuid4().hex}.csv"
+        copy_local_file_to_hdfs(
+            spark,
+            input_path.removeprefix("file://"),
+            resolved_input_path,
+        )
+    raw = read_and_validate_new_transactions(spark, resolved_input_path)
     input_count = raw.count()
     preprocessor = PipelineModel.load(f"{model_base}/preprocessor")
     relative_path, loader = MODEL_LOADERS[model_slug]
@@ -190,11 +219,14 @@ def run_prediction(
     )
     output.write.mode("overwrite").parquet(output_path)
     reloaded = spark.read.parquet(output_path)
-    rows = reloaded.orderBy(F.desc("fraud_probability")).collect()
-    if len(rows) != input_count:
+    summary = reloaded.agg(
+        F.count("*").alias("rows"),
+        F.sum(F.when(F.col("prediction") == 1, 1).otherwise(0)).alias("flagged"),
+    ).first()
+    if int(summary["rows"]) != input_count:
         raise RuntimeError("New prediction row count changed after HDFS save/reload")
 
-    flagged_count = sum(int(row["prediction"]) for row in rows)
+    flagged_count = int(summary["flagged"] or 0)
     report = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "input_path": input_path,
@@ -209,7 +241,13 @@ def run_prediction(
         "class_column_required": False,
         "model_retrained": False,
     }
-    write_local_outputs(rows, report, csv_path, report_path)
+    # ponytail: stream one Spark partition at a time; add a paged export when CSVs exceed local disk limits.
+    write_local_outputs(
+        reloaded.orderBy(F.desc("fraud_probability")).toLocalIterator(),
+        report,
+        csv_path,
+        report_path,
+    )
     copy_local_file_to_hdfs(
         spark,
         report_path,
@@ -225,8 +263,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", default=DEFAULT_INPUT)
     parser.add_argument("--output", default=DEFAULT_OUTPUT)
     parser.add_argument("--model-base", default=DEFAULT_MODEL_BASE)
-    parser.add_argument("--model", default=DEFAULT_MODEL, choices=sorted(MODEL_LOADERS))
-    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--model", default=None, choices=sorted(MODEL_LOADERS))
+    parser.add_argument("--threshold", type=float, default=None)
     parser.add_argument("--report", default=DEFAULT_REPORT)
     parser.add_argument("--csv", default=DEFAULT_CSV)
     return parser.parse_args()

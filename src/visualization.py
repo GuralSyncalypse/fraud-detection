@@ -30,12 +30,36 @@ CLASSIFIER_SLUGS = (
     "rf_class_weight",
     "rf_undersampling",
 )
+RF_CLASSIFIER_SLUGS = {
+    "rf_none",
+    "rf_class_weight",
+    "rf_undersampling",
+}
+
+MODEL_LABELS = {
+    "lr_none": "Logistic Regression · không cân bằng",
+    "lr_class_weight": "Logistic Regression · trọng số lớp",
+    "rf_none": "Random Forest · không cân bằng",
+    "rf_class_weight": "Random Forest · trọng số lớp",
+    "rf_undersampling": "Random Forest · giảm mẫu lớp bình thường",
+}
+
+
+def _style_axis(axis: Any) -> None:
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
+    axis.grid(axis="y", color="#DCE6F2", linewidth=0.8)
+    axis.set_axisbelow(True)
+    axis.tick_params(colors="#34495E", labelsize=10)
+    axis.title.set_color("#102A43")
+    axis.xaxis.label.set_color("#486581")
+    axis.yaxis.label.set_color("#486581")
 
 
 def _save_figure(figure: Any, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     figure.tight_layout()
-    figure.savefig(destination, dpi=160, bbox_inches="tight")
+    figure.savefig(destination, dpi=180, bbox_inches="tight")
     plt.close(figure)
 
 
@@ -168,6 +192,20 @@ def generate_visualizations(
     results.mkdir(parents=True, exist_ok=True)
     figures.mkdir(parents=True, exist_ok=True)
     plt.style.use("seaborn-v0_8-whitegrid")
+    plt.rcParams.update(
+        {
+            "figure.facecolor": "#F8FBFF",
+            "axes.facecolor": "#FFFFFF",
+            "axes.edgecolor": "#B8C7D9",
+            "font.size": 10,
+            "axes.titlesize": 16,
+            "axes.titleweight": "bold",
+            "axes.labelsize": 12,
+            "xtick.labelsize": 10,
+            "ytick.labelsize": 10,
+            "legend.fontsize": 10,
+        }
+    )
 
     labeled = spark.read.parquet(labeled_path).select(
         "transaction_id", "transaction_time", "amount", "class"
@@ -182,13 +220,14 @@ def generate_visualizations(
     ]
     _write_csv(class_rows, results / "class_distribution.csv", ["class", "count"])
     figure, axis = plt.subplots(figsize=(7, 4.5))
-    labels = ["Normal" if row["class"] == 0 else "Fraud" for row in class_rows]
+    labels = ["Bình thường" if row["class"] == 0 else "Gian lận" for row in class_rows]
     values = [row["count"] for row in class_rows]
-    bars = axis.bar(labels, values, color=["#4C78A8", "#E45756"])
+    bars = axis.bar(labels, values, color=["#2F80ED", "#EB5757"], width=0.58)
     axis.set_yscale("log")
-    axis.set_title("Fraud vs Normal (log scale)")
-    axis.set_ylabel("Number of transactions")
+    axis.set_title("Phân bố giao dịch: bình thường và gian lận", pad=14, fontweight="bold")
+    axis.set_ylabel("Số giao dịch · thang logarit")
     axis.bar_label(bars, labels=[f"{value:,}" for value in values], padding=3)
+    _style_axis(axis)
     _save_figure(figure, figures / "01_class_distribution.png")
 
     amount_lower, amount_upper = labeled.approxQuantile(
@@ -210,9 +249,10 @@ def generate_visualizations(
         width=width * 0.92,
         color="#4C78A8",
     )
-    axis.set_title("Amount distribution (1st–99th percentile)")
-    axis.set_xlabel("Amount")
-    axis.set_ylabel("Transactions")
+    axis.set_title("Phân bố số tiền giao dịch", pad=14, fontweight="bold")
+    axis.set_xlabel("Số tiền")
+    axis.set_ylabel("Số giao dịch")
+    _style_axis(axis)
     _save_figure(figure, figures / "02_amount_distribution.png")
 
     fraud = labeled.where(F.col("class") == 1)
@@ -231,11 +271,12 @@ def generate_visualizations(
         [row["center"] for row in fraud_histogram],
         [row["count"] for row in fraud_histogram],
         width=fraud_width * 0.92,
-        color="#E45756",
+        color="#EB5757",
     )
-    axis.set_title("Fraud transaction amount (up to 99th percentile)")
-    axis.set_xlabel("Amount")
-    axis.set_ylabel("Fraud transactions")
+    axis.set_title("Phân bố số tiền giao dịch gian lận", pad=14, fontweight="bold")
+    axis.set_xlabel("Số tiền")
+    axis.set_ylabel("Số giao dịch gian lận")
+    _style_axis(axis)
     _save_figure(figure, figures / "03_fraud_amount_distribution.png")
 
     comparison = pd.read_csv(results / "model_comparison.csv")
@@ -253,9 +294,9 @@ def generate_visualizations(
     figure, axis = plt.subplots(figsize=(6, 5))
     image = axis.imshow(np.log1p(confusion), cmap="Blues")
     figure.colorbar(image, ax=axis, label="log(1 + count)")
-    axis.set_xticks([0, 1], ["Predicted Normal", "Predicted Review"])
-    axis.set_yticks([0, 1], ["Actual Normal", "Actual Fraud"])
-    axis.set_title(f"Confusion Matrix – {selected_model}")
+    axis.set_xticks([0, 1], ["Dự đoán bình thường", "Dự đoán cần kiểm tra"])
+    axis.set_yticks([0, 1], ["Thực tế bình thường", "Thực tế gian lận"])
+    axis.set_title("Ma trận nhầm lẫn", pad=14, fontweight="bold")
     for row_index in range(2):
         for column_index in range(2):
             axis.text(
@@ -284,11 +325,12 @@ def generate_visualizations(
             label=metric.title(),
             color=color,
         )
-    axis.set_xticks(positions, comparison["slug"], rotation=25, ha="right")
+    axis.set_xticks(positions, [MODEL_LABELS.get(slug, slug) for slug in comparison["slug"]], rotation=20, ha="right")
     axis.set_ylim(0, 1.05)
-    axis.set_ylabel("Score for class=1")
-    axis.set_title("Fraud-class metric comparison")
-    axis.legend()
+    axis.set_ylabel("Điểm đánh giá cho lớp gian lận")
+    axis.set_title("So sánh hiệu năng các mô hình", pad=14, fontweight="bold")
+    axis.legend(["Độ chính xác", "Độ bao phủ", "F1"], frameon=False)
+    _style_axis(axis)
     _save_figure(figure, figures / "05_metric_comparison.png")
 
     pr_rows = collect_pr_curve(spark, prediction_base)
@@ -303,27 +345,32 @@ def generate_visualizations(
         axis.plot(
             [row["recall"] for row in rows],
             [row["precision"] for row in rows],
-            label=slug,
+            label=MODEL_LABELS.get(slug, slug),
             linewidth=1.8,
         )
     axis.set_xlim(0, 1)
     axis.set_ylim(0, 1.02)
-    axis.set_xlabel("Recall")
-    axis.set_ylabel("Precision")
-    axis.set_title("Approximate Precision–Recall curves (200 score bins)")
-    axis.legend(fontsize=8)
+    axis.set_xlabel("Độ bao phủ (Recall)")
+    axis.set_ylabel("Độ chính xác (Precision)")
+    axis.set_title("Đường cong Precision – Recall", pad=14, fontweight="bold")
+    axis.legend(fontsize=8, frameon=False)
+    _style_axis(axis)
     _save_figure(figure, figures / "06_precision_recall_curve.png")
 
+    importance_model = (
+        selected_model if selected_model in RF_CLASSIFIER_SLUGS else DEFAULT_MODEL
+    )
     importance = pd.read_csv(results / "rf_feature_importance.csv")
     importance = (
-        importance.loc[importance["slug"] == selected_model]
+        importance.loc[importance["slug"] == importance_model]
         .nlargest(15, "importance")
         .sort_values("importance")
     )
     figure, axis = plt.subplots(figsize=(9, 6))
     axis.barh(importance["feature"], importance["importance"], color="#54A24B")
-    axis.set_title(f"Random Forest feature importance – {selected_model}")
-    axis.set_xlabel("Importance (not causality)")
+    axis.set_title("Các yếu tố ảnh hưởng đến mô hình", pad=14, fontweight="bold")
+    axis.set_xlabel("Độ quan trọng · không phải quan hệ nhân quả")
+    _style_axis(axis)
     _save_figure(figure, figures / "07_rf_feature_importance.png")
 
     probability_histogram = collect_histogram(
@@ -342,9 +389,10 @@ def generate_visualizations(
         color="#F58518",
     )
     axis.set_yscale("log")
-    axis.set_xlabel("Fraud probability")
-    axis.set_ylabel("Transactions (log scale)")
-    axis.set_title(f"Fraud probability distribution – {selected_model}")
+    axis.set_xlabel("Xác suất gian lận")
+    axis.set_ylabel("Số giao dịch · thang logarit")
+    axis.set_title("Phân bố điểm rủi ro", pad=14, fontweight="bold")
+    _style_axis(axis)
     _save_figure(figure, figures / "08_probability_distribution.png")
 
     threshold_data = pd.read_csv(results / "threshold_analysis.csv")
@@ -359,14 +407,15 @@ def generate_visualizations(
             threshold_data["threshold"],
             threshold_data[metric],
             marker="o",
-            label=metric.title(),
+            label={"precision": "Độ chính xác", "recall": "Độ bao phủ", "f1": "F1"}[metric],
             color=color,
         )
     axis.set_ylim(0, 1.02)
-    axis.set_xlabel("Decision threshold")
-    axis.set_ylabel("Score")
-    axis.set_title(f"Threshold trade-off – {selected_model}")
-    axis.legend()
+    axis.set_xlabel("Ngưỡng cảnh báo")
+    axis.set_ylabel("Điểm đánh giá")
+    axis.set_title("Ảnh hưởng của ngưỡng cảnh báo", pad=14, fontweight="bold")
+    axis.legend(frameon=False)
+    _style_axis(axis)
     _save_figure(figure, figures / "09_threshold_analysis.png")
 
     top_suspicious = (
@@ -408,18 +457,20 @@ def generate_visualizations(
     axis.barh(
         [str(row["transaction_id"]) for row in chart_rows],
         [float(row["fraud_probability"]) for row in chart_rows],
-        color="#E45756",
+        color="#EB5757",
     )
     axis.set_xlim(0, 1)
-    axis.set_xlabel("Fraud probability")
-    axis.set_ylabel("Transaction ID")
-    axis.set_title("Top flagged transactions – needs review")
+    axis.set_xlabel("Xác suất gian lận")
+    axis.set_ylabel("Mã giao dịch")
+    axis.set_title("Top giao dịch cần kiểm tra", pad=14, fontweight="bold")
+    _style_axis(axis)
     _save_figure(figure, figures / "10_top_suspicious_transactions.png")
 
     figure_files = sorted(path.name for path in figures.glob("*.png"))
     report = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "selected_demo_model": selected_model,
+        "feature_importance_model": importance_model,
         "selection_note": "Selected for demonstration, not declared a business-optimal model.",
         "spark_aggregation_before_pandas": True,
         "full_dataset_to_pandas": False,
