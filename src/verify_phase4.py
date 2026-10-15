@@ -27,6 +27,22 @@ def main() -> None:
         raise RuntimeError(
             f"Unexpected model set: expected={EXPECTED_MODELS}, actual={reported_models}"
         )
+    selection = report.get("selection", {})
+    classifier_models = EXPECTED_MODELS - {"isolation_forest"}
+    if selection.get("recommended_model") not in classifier_models:
+        raise RuntimeError("Missing or invalid validation-based model selection")
+    thresholds = selection.get("thresholds_by_model", {})
+    if set(thresholds) != classifier_models or any(
+        not 0.0 <= float(value) <= 1.0 for value in thresholds.values()
+    ):
+        raise RuntimeError("Invalid validation-based thresholds")
+    reported_thresholds = {
+        row["slug"]: float(row["decision_threshold"])
+        for row in report["model_comparison"]
+        if row["slug"] in classifier_models
+    }
+    if reported_thresholds != {key: float(value) for key, value in thresholds.items()}:
+        raise RuntimeError("Model thresholds do not match selection metadata")
 
     for metrics in report["model_comparison"]:
         confusion_total = sum(int(metrics[name]) for name in ("tp", "tn", "fp", "fn"))

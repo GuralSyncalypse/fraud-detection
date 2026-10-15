@@ -153,6 +153,8 @@ def clean_transactions(raw: DataFrame) -> DataFrame:
             F.col("transaction_id").isNotNull()
             & F.col("transaction_time").isNotNull()
             & F.col("amount").isNotNull()
+            & ~F.isnan(F.col("amount"))
+            & (F.col("amount") >= 0)
         )
         .dropDuplicates(["transaction_id"])
         .withColumn("transaction_year", F.year("transaction_time"))
@@ -160,7 +162,7 @@ def clean_transactions(raw: DataFrame) -> DataFrame:
 
 
 def clean_labels(raw_labels: DataFrame) -> DataFrame:
-    return (
+    normalized = (
         raw_labels.select(
             "transaction_id",
             F.when(F.upper(F.trim(F.col("label"))) == "YES", F.lit(1))
@@ -169,8 +171,18 @@ def clean_labels(raw_labels: DataFrame) -> DataFrame:
             .alias("class"),
         )
         .where(F.col("transaction_id").isNotNull() & F.col("class").isNotNull())
-        .dropDuplicates(["transaction_id"])
     )
+    conflicting = (
+        normalized.groupBy("transaction_id")
+        .agg(F.countDistinct("class").alias("class_count"))
+        .where(F.col("class_count") > 1)
+        .count()
+    )
+    if conflicting:
+        raise ValueError(
+            f"Found {conflicting} transaction IDs with conflicting fraud labels"
+        )
+    return normalized.dropDuplicates(["transaction_id"])
 
 
 def collect_clean_profile(

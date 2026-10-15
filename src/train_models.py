@@ -105,21 +105,38 @@ def run_phase3(
     print(f"[phase3] Reading labeled Parquet from {input_path}")
     source = spark.read.parquet(input_path)
     base_features = prepare_base_features(source)
-    train, test = deterministic_train_test_split(base_features, seed=RANDOM_SEED)
+    train_pool, test = deterministic_train_test_split(
+        base_features, seed=RANDOM_SEED
+    )
+    train, validation = deterministic_train_test_split(
+        train_pool, train_fraction=0.75, seed=RANDOM_SEED + 3
+    )
 
     train_path = f"{split_base}/train"
+    validation_path = f"{split_base}/validation"
     test_path = f"{split_base}/test"
-    print("[phase3] Saving deterministic train/test splits")
+    print("[phase3] Saving deterministic train/validation/test splits")
     train.write.mode("overwrite").partitionBy("class").parquet(train_path)
+    validation.write.mode("overwrite").partitionBy("class").parquet(validation_path)
     test.write.mode("overwrite").partitionBy("class").parquet(test_path)
 
     # Reloading makes later phases independent of upstream partition order.
     train = spark.read.parquet(train_path)
+    validation = spark.read.parquet(validation_path)
     test = spark.read.parquet(test_path)
     train_distribution = class_distribution(train)
+    validation_distribution = class_distribution(validation)
     test_distribution = class_distribution(test)
-    total_count = train_distribution["total"] + test_distribution["total"]
-    actual_train_fraction = train_distribution["total"] / total_count
+    total_count = (
+        train_distribution["total"]
+        + validation_distribution["total"]
+        + test_distribution["total"]
+    )
+    actual_fractions = {
+        "train": train_distribution["total"] / total_count,
+        "validation": validation_distribution["total"] / total_count,
+        "test": test_distribution["total"] / total_count,
+    }
 
     print("[phase3] Creating class-neutral, natural-distribution training cap")
     modeling_train = deterministic_cap(
@@ -284,11 +301,19 @@ def run_phase3(
         "spark_version": spark.version,
         "input": input_path,
         "split": {
-            "method": "deterministic xxhash64(transaction_id, seed)",
-            "requested_train_fraction": 0.8,
-            "actual_train_fraction": round(actual_train_fraction, 8),
+            "method": "deterministic two-stage xxhash64(transaction_id, seed)",
+            "requested_fractions": {
+                "train": 0.6,
+                "validation": 0.2,
+                "test": 0.2,
+            },
+            "actual_fractions": {
+                key: round(value, 8) for key, value in actual_fractions.items()
+            },
             "train": train_distribution,
+            "validation": validation_distribution,
             "test": test_distribution,
+            "validation_was_sampled": False,
             "test_was_sampled": False,
         },
         "supervised_training": {
@@ -321,7 +346,11 @@ def run_phase3(
         "isolation_forest": isolation_summary,
         "training_seconds": training_times,
         "model_paths": model_paths,
-        "split_paths": {"train": train_path, "test": test_path},
+        "split_paths": {
+            "train": train_path,
+            "validation": validation_path,
+            "test": test_path,
+        },
     }
     write_report(report, report_path)
     report_hdfs_path = f"{model_base}/metadata/phase3_summary.json"

@@ -275,8 +275,8 @@ Pipeline:
 ```text
 Labeled Parquet
     ↓ deterministic hash split, seed 42
-Train 80%                              Test 20%
-    ↓ fit preprocessing trên Train        └── giữ nguyên phân bố thực
+Train 60%             Validation 20%                Test 20%
+    ↓ fit model        └── chọn threshold/model       └── đánh giá cuối
     ├── LR None
     ├── LR Class Weight
     ├── RF None
@@ -285,7 +285,7 @@ Train 80%                              Test 20%
     └── Spark features → sklearn Isolation Forest
 ```
 
-Feature vector không chứa `class`, transaction/customer/card/merchant ID. StringIndexer, OneHotEncoder và StandardScaler chỉ được fit trên Train để tránh data leakage.
+Feature vector không chứa `class`, transaction/customer/card/merchant ID. StringIndexer, OneHotEncoder và StandardScaler chỉ được fit trên Train để tránh data leakage. Threshold và model recommendation được chọn trên Validation; Test chỉ dùng để đánh giá cuối.
 
 Mặc định LR/RF dùng compute cap khoảng 500.000 Train rows, chọn class-neutral bằng hash để phù hợp máy cá nhân. Test Set đầy đủ không bị sampling. Có thể tăng giới hạn nếu Docker có nhiều RAM/CPU:
 
@@ -354,7 +354,7 @@ fraud_probability hoặc anomaly_score,
 prediction, status, actual_class, model
 ```
 
-### Kết quả thực nghiệm hiện tại tại threshold 0,5
+### Kết quả thực nghiệm minh họa tại threshold 0,5
 
 | Model | Imbalance | Precision | Recall | F1 | PR-AUC |
 |---|---|---:|---:|---:|---:|
@@ -370,7 +370,7 @@ Diễn giải:
 - Class weight tăng mạnh Recall nhưng tạo nhiều False Positive.
 - RF không xử lý imbalance xếp hạng khá tốt theo PR-AUC, nhưng threshold mặc định `0,5` quá bảo thủ và chỉ bắt được 4/2.690 fraud.
 - Threshold thấp thường tăng Recall và giảm Precision.
-- Không tự động chọn threshold “tối ưu” khi chưa biết chi phí nghiệp vụ của False Negative và False Positive.
+- Code chọn threshold kỹ thuật theo F1 trên Validation; khi triển khai thật vẫn cần thay bằng chi phí False Negative/False Positive.
 - Random Forest feature importance không đồng nghĩa với quan hệ nhân quả.
 
 ## 11. Phase 5 – Visualization, Demo và Prediction mới
@@ -436,7 +436,7 @@ Windows:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\predict_new_transactions.ps1
 ```
 
-Mặc định dùng RF Undersampling và threshold `0,5`. Có thể chọn model/threshold khác mà không train lại:
+Mặc định đọc model và threshold được chọn từ Validation trong Phase 4. Có thể chọn model/threshold khác mà không train lại:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\predict_new_transactions.ps1 --model lr_class_weight --threshold 0.7
@@ -560,9 +560,51 @@ Pipeline yêu cầu đã hoàn thành end-to-end: raw data → HDFS → cleaning
 
 Các hướng mở rộng sau đồ án:
 
-- Spark Structured Streaming hoặc Kafka cho near-real-time scoring.
+- Kết nối cảnh báo Flink với dashboard và lưu kết quả streaming vào HDFS.
 - Feature lịch sử theo cửa sổ thời gian và hành vi tài khoản.
 - Probability calibration và threshold theo chi phí nghiệp vụ.
 - Explainability, drift monitoring, model registry và analyst feedback loop.
 
 Nguyên tắc tiếp tục giữ nguyên: dữ liệu lớn xử lý bằng Spark; chỉ aggregate hoặc sample nhỏ mới đưa sang pandas/matplotlib; không sampling Test Set; không hard-code metric; không đưa `Class` vào feature.
+
+## 18. Nhánh streaming tùy chọn: Kafka + Flink
+
+Nhánh này bổ sung xử lý giao dịch thời gian thực bên cạnh pipeline HDFS/Spark/ML. Producer gửi giao dịch mô phỏng vào Kafka; cùng một luồng được xử lý theo hai cách độc lập:
+
+- Flink áp dụng luật số tiền (`amount > 1.000 USD` mặc định) rồi ghi vào `flink-alerts`.
+- `flink-ml-scorer` tải model scikit-learn Isolation Forest đã huấn luyện ở `output/models/isolation_forest.joblib`, chấm điểm từng giao dịch và ghi giao dịch bất thường vào `flink-ml-alerts` khi model phát hiện outlier với điểm ít nhất `0.05` (có thể đổi qua `ML_ANOMALY_SCORE_MIN`).
+
+Dashboard có hai tab riêng: **Flink · Ngưỡng giao dịch** và **Machine Learning · Isolation Forest**. Điểm Isolation Forest là điểm bất thường, không phải xác suất gian lận. Cần chạy Phase 3 để tạo model artifact trước khi có dự đoán ML realtime.
+
+Chạy riêng nhánh Flink trên Windows PowerShell:
+
+```powershell
+docker compose --profile streaming up --build -d dashboard stream-kafka flink-kafka-init flink-producer flink-jobmanager flink-taskmanager flink-ml-scorer
+docker compose --profile streaming ps
+```
+
+Hoặc khởi động toàn bộ đồ án, gồm cả HDFS/Spark/Jupyter/Dashboard và Flink:
+
+```powershell
+docker compose --profile streaming up --build -d
+```
+
+- Flink Web UI: <http://localhost:18082> — vào **Running Jobs** để xem job graph.
+- Giao diện Fraud Detection: <http://localhost:8501> — chọn tab ngưỡng Flink hoặc tab Isolation Forest; dashboard tự làm mới mỗi 5 giây.
+- Kafka từ máy host: `localhost:19092`.
+- Flink mặc định gắn cờ giao dịch trên 1.000 USD là `NEEDS_REVIEW`; producer phát một giao dịch giá trị cao sau mỗi 8 giao dịch.
+- Tab Isolation Forest cần `output/models/isolation_forest.joblib`, được tạo bởi Phase 3; kết quả realtime chỉ phát các giao dịch model phân loại là bất thường.
+
+Xem cảnh báo trực tiếp trong PowerShell:
+
+```powershell
+docker compose --profile streaming exec stream-kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server stream-kafka:19092 --topic flink-alerts --from-beginning
+```
+
+Trong terminal khác, theo dõi generator:
+
+```powershell
+docker compose --profile streaming logs -f flink-producer
+```
+
+Nhánh streaming dùng Flink checkpoint mỗi 10 giây với bảo đảm at-least-once. UI dùng cổng `18082` và Kafka dùng `19092` để tránh trùng với Spark hoặc demo Flink riêng đang dùng `8080–8082`, `18080–18081` và `9092`.

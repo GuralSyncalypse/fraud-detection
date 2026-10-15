@@ -5,11 +5,13 @@ import csv
 import cgi
 import io
 import json
+import os
 import mimetypes
 import subprocess
 import tempfile
 import threading
 import uuid
+from collections import deque
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,7 +27,7 @@ PAGE = r'''<!doctype html>
   <style>
     :root { --bg:#07111f; --panel:#0d1b2d; --panel2:#10243b; --line:#1d3854; --text:#e8f1fb; --muted:#8da6bf; --cyan:#49d7e8; --green:#45dda0; --amber:#ffc857; --red:#ff6b7a; }
     * { box-sizing:border-box; }
-    body { margin:0; color:var(--text); background:radial-gradient(circle at 20% 0%, #123052 0, var(--bg) 45%); font:14px/1.5 Inter, Segoe UI, sans-serif; }
+    body { margin:0; overflow-x:hidden; color:var(--text); background:radial-gradient(circle at 20% 0%, #123052 0, var(--bg) 45%); font:14px/1.5 Inter, Segoe UI, sans-serif; }
     .shell { max-width:1440px; margin:auto; padding:28px; }
     header { display:flex; justify-content:space-between; align-items:end; gap:20px; margin-bottom:24px; }
     .eyebrow { color:var(--cyan); font-size:11px; font-weight:700; letter-spacing:.18em; text-transform:uppercase; }
@@ -64,6 +66,9 @@ PAGE = r'''<!doctype html>
     .upload-status { grid-column:1 / -1; min-height:18px; color:var(--muted); font-size:12px; }
     .upload-status.success { color:var(--green); }
     .upload-status.error { color:var(--red); }
+    .upload-results { grid-column:1 / -1; min-width:0; width:100%; }
+    .upload-results h3 { margin:0 0 4px; font-size:15px; }
+    .upload-results p { margin:0 0 10px; color:var(--muted); font-size:12px; }
     .cards { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:14px; margin-bottom:18px; }
     .card, .panel { border:1px solid var(--line); border-radius:16px; background:linear-gradient(145deg,rgba(16,36,59,.96),rgba(10,24,40,.96)); box-shadow:0 12px 30px #0003; }
     .card { position:relative; overflow:hidden; padding:18px; min-height:118px; }
@@ -76,8 +81,8 @@ PAGE = r'''<!doctype html>
     .accent { color:var(--cyan); }
     .good { color:var(--green); }
     .warn { color:var(--amber); }
-    .layout { display:grid; grid-template-columns:1.2fr .8fr; gap:18px; }
-    .panel { padding:20px; margin-bottom:18px; }
+    .layout { display:grid; grid-template-columns:minmax(0,1.2fr) minmax(0,.8fr); gap:18px; }
+    .panel { min-width:0; padding:20px; margin-bottom:18px; }
     .wide { grid-column:1 / -1; }
     .model-table { width:100%; border-collapse:collapse; }
     th, td { padding:11px 8px; border-bottom:1px solid var(--line); text-align:left; white-space:nowrap; }
@@ -122,7 +127,10 @@ PAGE = r'''<!doctype html>
     .lightbox-subtitle { padding-top:5px; color:var(--muted); font-size:14px; }
     .lightbox-close { flex:none; width:40px; height:40px; padding:0; border:1px solid #3b7892; border-radius:50%; color:var(--text); background:#123149; font-size:24px; line-height:1; }
     .lightbox-close:hover { background:#1b5270; }
-    .lightbox img { display:block; width:100%; max-height:calc(94vh - 104px); object-fit:contain; border-radius:12px; background:#f7fbff; }
+    .lightbox img { display:block; width:100%; max-height:calc(94vh - 156px); min-height:0; object-fit:contain; border-radius:12px; background:#f7fbff; }
+    .lightbox-controls { display:flex; align-items:center; justify-content:center; gap:14px; padding-top:12px; }
+    .lightbox-nav { min-width:112px; }
+    .lightbox-count { min-width:54px; color:var(--muted); text-align:center; font-variant-numeric:tabular-nums; }
     .clickable-row { cursor:pointer; }
     .clickable-row:focus-visible { outline:2px solid var(--cyan); outline-offset:-2px; }
     .transaction-detail { position:fixed; inset:0; z-index:19; display:none; align-items:center; justify-content:center; padding:24px; background:#020914e8; backdrop-filter:blur(10px); }
@@ -141,9 +149,25 @@ PAGE = r'''<!doctype html>
     .detail-item span { display:block; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.07em; }
     .detail-item strong { display:block; margin-top:4px; color:var(--text); font-size:17px; }
     .detail-note { margin:18px 0 0; color:var(--muted); font-size:13px; }
-    .rows { overflow:auto; max-height:390px; }
+    .rows { min-width:0; max-width:100%; overflow:auto; max-height:390px; }
     .empty { color:var(--muted); padding:20px 0; }
-    @media (max-width:900px) { .cards { grid-template-columns:repeat(2,minmax(0,1fr)); } .layout { grid-template-columns:1fr; } .risk-summary { grid-template-columns:auto 1fr auto; } .risk-state { grid-column:2 / -1; justify-self:start; } .upload-panel { grid-template-columns:1fr; } .upload-form { justify-content:flex-start; } }
+    .flink-panel { border-color:#2a617e; }
+    .stream-tabs { display:flex; flex-wrap:wrap; gap:8px; margin:16px 0 0; padding-bottom:12px; border-bottom:1px solid var(--line); }
+    .stream-tab { min-height:42px; border-color:var(--line); color:var(--muted); background:#0a192a; }
+    .stream-tab[aria-selected="true"] { border-color:#347e9e; color:var(--text); background:#123149; box-shadow:inset 0 -2px var(--cyan); }
+    .stream-pane { padding-top:16px; }
+    .flink-heading { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
+    .flink-heading > div { min-width:0; }
+    .flink-heading h2 { margin-bottom:4px; }
+    .flink-heading p { margin:0 0 14px; color:var(--muted); font-size:13px; }
+    .stream-state { flex:none; padding:6px 10px; border:1px solid #725b2b; border-radius:999px; color:#ffd978; font-size:11px; font-weight:900; letter-spacing:.06em; }
+    .stream-state.connected { border-color:#2e8d70; color:#8df0c1; }
+    .flink-summary { display:flex; flex-wrap:wrap; gap:10px; margin-bottom:14px; }
+    .flink-summary div { flex:1 1 160px; padding:12px 14px; border:1px solid var(--line); border-radius:12px; background:#0a192a; }
+    .flink-summary span { display:block; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
+    .flink-summary strong { display:block; margin-top:3px; color:var(--cyan); font-size:20px; }
+    .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
+    @media (max-width:900px) { .cards { grid-template-columns:repeat(2,minmax(0,1fr)); } .layout { grid-template-columns:minmax(0,1fr); } .risk-summary { grid-template-columns:auto 1fr auto; } .risk-state { grid-column:2 / -1; justify-self:start; } .upload-panel { grid-template-columns:1fr; } .upload-form { justify-content:flex-start; } }
     @media (max-width:560px) { .shell { padding:18px; } header { align-items:start; flex-direction:column; } .cards { grid-template-columns:1fr; } .figures { grid-template-columns:1fr; } .risk-summary { grid-template-columns:auto 1fr; } .risk-stat { grid-column:2; padding-left:0; border-left:0; } .risk-state { grid-column:2; } .upload-form { align-items:stretch; flex-direction:column; } .file-picker { max-width:none; } }
   </style>
 </head>
@@ -158,17 +182,39 @@ PAGE = r'''<!doctype html>
       <button id="refresh">↻ Làm mới dữ liệu</button>
     </header>
     <div id="status" class="status">Đang tải dữ liệu...</div>
-    <nav class="quick-nav" aria-label="Điều hướng nhanh"><a href="#overview">Tổng quan</a><a href="#suspicious">Giao dịch cần kiểm tra</a><a href="#figures">Biểu đồ phân tích</a></nav>
+    <nav class="quick-nav" aria-label="Điều hướng nhanh"><a href="#overview">Tổng quan</a><a href="#flink-alerts-panel">Cảnh báo realtime</a><a href="#suspicious">Giao dịch cần kiểm tra</a><a href="#figures">Biểu đồ phân tích</a></nav>
     <section id="risk-summary" class="risk-summary" aria-live="polite">
       <div class="risk-mark">!</div>
       <div class="risk-copy"><div class="label">Tóm tắt rủi ro</div><h2 id="risk-title">Đang phân tích dữ liệu...</h2><p id="risk-detail">Đang tải danh sách ưu tiên.</p></div>
       <div class="risk-stat"><span>Danh sách ưu tiên</span><strong id="risk-count">—</strong></div>
       <div id="risk-state" class="risk-state">ĐANG TẢI</div>
     </section>
+    <section id="flink-alerts-panel" class="panel wide flink-panel">
+      <div class="flink-heading"><div><h2>Cảnh báo giao dịch thời gian thực</h2><p>Chọn cách phát hiện để xem riêng các kết quả từ cùng luồng giao dịch Kafka.</p></div></div>
+      <div class="stream-tabs" role="tablist" aria-label="Chế độ phát hiện gian lận">
+        <button id="stream-tab-rule" class="stream-tab" type="button" role="tab" aria-selected="true" aria-controls="stream-pane-rule">Flink · Ngưỡng giao dịch</button>
+        <button id="stream-tab-ml" class="stream-tab" type="button" role="tab" aria-selected="false" aria-controls="stream-pane-ml">Machine Learning · Isolation Forest</button>
+      </div>
+      <div id="stream-pane-rule" class="stream-pane" role="tabpanel" aria-labelledby="stream-tab-rule">
+        <div class="flink-heading"><div><h2>Luật ngưỡng trong Flink</h2><p>Đọc topic <code>flink-alerts</code>; gắn cờ giao dịch có số tiền vượt ngưỡng cố định.</p></div><span id="flink-connection" class="stream-state">ĐANG KẾT NỐI</span></div>
+        <div class="flink-summary"><div><span>Cảnh báo gần đây</span><strong id="flink-live-count">0</strong><span id="flink-alert-announcement" class="sr-only" role="status" aria-atomic="true"></span></div><div><span>Ngưỡng demo</span><strong id="flink-threshold">1.000 USD</strong></div><div><span>Trạng thái dữ liệu</span><strong id="flink-updated">Đang chờ sự kiện</strong></div></div>
+        <div class="rows"><table class="model-table"><thead><tr><th>Mã giao dịch</th><th>Tài khoản</th><th>Số tiền</th><th>Ngưỡng</th><th>Lý do</th><th>Thời điểm phát hiện</th></tr></thead><tbody id="flink-alerts"></tbody></table></div>
+      </div>
+      <div id="stream-pane-ml" class="stream-pane" role="tabpanel" aria-labelledby="stream-tab-ml" hidden>
+        <div class="flink-heading"><div><h2>Mô hình Isolation Forest đã huấn luyện</h2><p>Chấm điểm giao dịch theo đặc trưng học được từ dữ liệu; điểm bất thường cao hơn nghĩa là khác thường hơn, không phải xác suất gian lận.</p></div><span id="ml-connection" class="stream-state">ĐANG KẾT NỐI</span></div>
+        <div class="flink-summary"><div><span>Cảnh báo bất thường gần đây</span><strong id="ml-live-count">0</strong></div><div><span>Mô hình</span><strong>Isolation Forest</strong></div><div><span>Điểm bất thường tối thiểu</span><strong id="ml-score-threshold">0,05</strong></div><div><span>Tình trạng model file</span><strong id="ml-model-status">Đang kiểm tra</strong></div><div><span>Dữ liệu mới nhất</span><strong id="ml-updated">Đang chờ sự kiện</strong></div></div>
+        <div class="rows"><table class="model-table"><thead><tr><th>Mã giao dịch</th><th>Tài khoản</th><th>Số tiền</th><th>Điểm bất thường</th><th>Lý do</th><th>Thời điểm phát hiện</th></tr></thead><tbody id="ml-alerts"></tbody></table></div>
+      </div>
+    </section>
     <section class="upload-panel">
       <div class="upload-copy"><div class="label">Dự đoán dữ liệu mới</div><h2>Upload CSV để kiểm tra giao dịch</h2><p>Dùng đúng các cột mẫu và hệ thống sẽ chạy model đang được chọn.</p></div>
       <form id="upload-form" class="upload-form"><label class="file-picker"><span id="file-label">Chọn file CSV</span><input id="prediction-file" type="file" accept=".csv,text/csv"></label><button id="upload-submit" type="submit">Chạy dự đoán</button><a class="template-link" href="/api/prediction-template" download="prediction_template.csv">Tải file mẫu</a></form>
       <div id="upload-status" class="upload-status" aria-live="polite"></div>
+      <div id="upload-results" class="upload-results" hidden aria-live="polite">
+        <h3 id="upload-flagged-title">Giao dịch bị gắn cờ</h3>
+        <p>Các giao dịch này vượt ngưỡng của model và cần được kiểm tra thêm; đây chưa phải xác nhận gian lận.</p>
+        <div class="rows"><table class="model-table"><thead><tr><th>Mã giao dịch</th><th>Thời gian</th><th>Số tiền</th><th>Xác suất gian lận</th><th>Kết quả</th></tr></thead><tbody id="upload-flagged-results"></tbody></table></div>
+      </div>
     </section>
     <section id="overview" class="cards">
       <article class="card"><div class="label">Giao dịch sạch</div><div id="clean" class="value accent">—</div></article>
@@ -205,6 +251,11 @@ PAGE = r'''<!doctype html>
         <button id="lightbox-close" class="lightbox-close" type="button" aria-label="Đóng ảnh">×</button>
       </div>
       <img id="lightbox-image" alt="">
+      <div class="lightbox-controls" aria-label="Điều hướng biểu đồ">
+        <button id="lightbox-prev" class="lightbox-nav" type="button" aria-label="Biểu đồ trước">← Trước</button>
+        <span id="lightbox-count" class="lightbox-count" aria-live="polite">1 / 10</span>
+        <button id="lightbox-next" class="lightbox-nav" type="button" aria-label="Biểu đồ sau">Sau →</button>
+      </div>
     </div>
   </div>
   <div id="transaction-detail" class="transaction-detail" aria-hidden="true">
@@ -256,6 +307,22 @@ PAGE = r'''<!doctype html>
     let suspiciousRows = [];
     const suspiciousColumns = [{key:'transaction_id'},{key:'transaction_time'},{key:'amount',cls:'num',render:row => amount(row.amount)},{key:'fraud_probability',cls:'num',render:row => probability(row.fraud_probability)},{key:'status',render:row => statusBadge(row.status)},{key:'actual_class',cls:'num',render:row => actualLabel(row.actual_class)}];
     const predictionColumns = [{key:'transaction_id'},{key:'amount',cls:'num',render:row => amount(row.amount)},{key:'fraud_probability',cls:'num',render:row => probability(row.fraud_probability)},{key:'status',render:row => statusBadge(row.status)}];
+    const flaggedPredictionColumns = [{key:'transaction_id'},{key:'transaction_time'},{key:'amount',cls:'num',render:row => amount(row.amount)},{key:'fraud_probability',cls:'num',render:row => probability(row.fraud_probability)},{key:'status',render:row => statusBadge(row.status)}];
+    const flinkAlertColumns = [
+      {key:'transactionId'}, {key:'accountId'},
+      {key:'amount',cls:'num',render:row => `${amount(row.amount)} ${safe(row.currency || 'USD')}`},
+      {key:'threshold',cls:'num',render:row => `${amount(row.threshold)} USD`},
+      {key:'reason',render:row => `<span class="pill warn">${safe(statusLabel(row.status))}</span> <small>${safe(row.reason || '')}</small>`},
+      {key:'detectedAt',render:row => row.detectedAt ? safe(new Date(row.detectedAt).toLocaleString('vi-VN')) : '—'}
+    ];
+    const mlAlertColumns = [
+      {key:'transactionId'}, {key:'accountId'},
+      {key:'amount',cls:'num',render:row => `${amount(row.amount)} USD`},
+      {key:'anomalyScore',cls:'num',render:row => Number(row.anomalyScore || 0).toFixed(5)},
+      {key:'reason',render:row => `<span class="pill warn">Bất thường</span> <small>${safe(row.model || 'Isolation Forest')}</small>`},
+      {key:'detectedAt',render:row => row.detectedAt ? safe(new Date(row.detectedAt).toLocaleString('vi-VN')) : '—'}
+    ];
+    let latestFlinkAlertId = null;
     function safe(value) { return String(value ?? '—').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
     function renderRows(id, rows, columns, empty='Chưa có dữ liệu') {
       const body = $(id);
@@ -267,6 +334,49 @@ PAGE = r'''<!doctype html>
       $('prediction-meta').innerHTML = `<div><span class="label">Số giao dịch</span><strong>${number(prediction.input_rows ?? rows.length)}</strong></div><div><span class="label">Bị gắn cờ</span><strong class="${prediction.flagged_rows ? 'warn' : 'good'}">${number(prediction.flagged_rows)}</strong></div><div><span class="label">Mô hình</span><strong>${safe(modelLabel(prediction.model))}</strong></div><div><span class="label">Ngưỡng cảnh báo</span><strong>${Number(prediction.threshold || 0).toFixed(2)}</strong></div>`;
       renderRows('predictions', rows, predictionColumns, 'Chưa có kết quả dự đoán');
     }
+    function renderUploadFlagged(prediction) {
+      const rows = prediction.flagged_transactions || (prediction.rows || []).filter(row => row.status === 'NEEDS_REVIEW' || Number(row.prediction) === 1);
+      $('upload-flagged-title').textContent = `Giao dịch bị gắn cờ (${number(prediction.flagged_rows ?? rows.length)})`;
+      renderRows('upload-flagged-results', rows, flaggedPredictionColumns, 'Không có giao dịch nào vượt ngưỡng cảnh báo.');
+      $('upload-results').hidden = false;
+    }
+    function renderFlinkAlerts(feed={}) {
+      const connected = Boolean(feed.connected);
+      const alerts = feed.alerts || [];
+      $('flink-connection').className = `stream-state ${connected ? 'connected' : ''}`;
+      $('flink-connection').textContent = connected ? 'KAFKA ĐANG KẾT NỐI' : 'ĐANG CHỜ KAFKA';
+      $('flink-live-count').textContent = number(feed.total_alerts ?? alerts.length);
+      $('flink-threshold').textContent = `${amount(feed.threshold ?? 1000)} USD`;
+      $('flink-updated').textContent = feed.last_message_at ? safe(new Date(feed.last_message_at).toLocaleString('vi-VN')) : (connected ? 'Đang chờ giao dịch vượt ngưỡng' : 'Bật nhánh streaming để xem');
+      renderRows('flink-alerts', alerts, flinkAlertColumns, connected ? 'Đang chờ Flink phát hiện giao dịch vượt ngưỡng' : 'Khởi động nhánh Kafka + Flink để nhận cảnh báo tại đây');
+      const latest = alerts[0];
+      if (latest?.transactionId && latest.transactionId !== latestFlinkAlertId) {
+        latestFlinkAlertId = latest.transactionId;
+        $('flink-alert-announcement').textContent = `Cảnh báo Flink mới: giao dịch ${latest.transactionId}, ${amount(latest.amount)} ${latest.currency || 'USD'}, ${latest.reason || statusLabel(latest.status)}.`;
+      }
+    }
+    function renderMLAlerts(feed={}) {
+      const connected = Boolean(feed.connected);
+      const modelReady = Boolean(feed.model_ready);
+      const alerts = feed.alerts || [];
+      $('ml-connection').className = `stream-state ${connected && modelReady ? 'connected' : ''}`;
+      $('ml-connection').textContent = !connected ? 'ĐANG CHỜ KAFKA' : modelReady ? 'KAFKA ĐANG KẾT NỐI' : 'CHƯA CÓ MODEL';
+      $('ml-live-count').textContent = number(feed.total_alerts ?? alerts.length);
+      $('ml-score-threshold').textContent = Number(feed.score_threshold ?? 0.05).toFixed(2);
+      $('ml-model-status').textContent = modelReady ? 'Đã có model đã huấn luyện' : 'Thiếu isolation_forest.joblib';
+      $('ml-updated').textContent = feed.last_message_at ? safe(new Date(feed.last_message_at).toLocaleString('vi-VN')) : (connected && modelReady ? 'Đang chờ giao dịch bất thường' : 'Chạy Phase 3 để tạo model');
+      const empty = !modelReady ? 'Chưa có file mô hình. Hãy chạy Phase 3 để huấn luyện Isolation Forest.' : connected ? 'Đang chờ mô hình phát hiện giao dịch bất thường' : 'Bật nhánh streaming để nhận điểm từ mô hình';
+      renderRows('ml-alerts', alerts, mlAlertColumns, empty);
+    }
+    function selectStreamTab(mode) {
+      const ruleSelected = mode === 'rule';
+      $('stream-tab-rule').setAttribute('aria-selected', String(ruleSelected));
+      $('stream-tab-ml').setAttribute('aria-selected', String(!ruleSelected));
+      $('stream-pane-rule').hidden = !ruleSelected;
+      $('stream-pane-ml').hidden = ruleSelected;
+    }
+    $('stream-tab-rule').addEventListener('click', () => selectStreamTab('rule'));
+    $('stream-tab-ml').addEventListener('click', () => selectStreamTab('ml'));
     function renderSuspicious(rows) {
       suspiciousRows = rows || [];
       const query = $('suspicious-search').value.trim().toLowerCase();
@@ -309,12 +419,23 @@ PAGE = r'''<!doctype html>
       $('transaction-detail').setAttribute('aria-hidden', 'true');
       document.body.classList.remove('modal-open');
     }
-    function openFigure(figure) {
+    let lightboxFigures = [];
+    let lightboxIndex = 0;
+    function showFigure(index) {
+      if (!lightboxFigures.length) return;
+      lightboxIndex = (index + lightboxFigures.length) % lightboxFigures.length;
+      const figure = lightboxFigures[lightboxIndex];
       const image = figure.querySelector('img');
       $('lightbox-image').src = image.src;
       $('lightbox-image').alt = image.alt;
       $('lightbox-title').textContent = figure.querySelector('.figure-title')?.textContent || 'Xem biểu đồ';
       $('lightbox-subtitle').textContent = figure.querySelector('small')?.textContent || '';
+      $('lightbox-count').textContent = `${lightboxIndex + 1} / ${lightboxFigures.length}`;
+    }
+    function openFigure(figure) {
+      lightboxFigures = Array.from(document.querySelectorAll('#figures figure'));
+      lightboxIndex = lightboxFigures.indexOf(figure);
+      showFigure(lightboxIndex);
       $('lightbox').classList.add('is-open');
       $('lightbox').setAttribute('aria-hidden', 'false');
       document.body.classList.add('modal-open');
@@ -335,10 +456,22 @@ PAGE = r'''<!doctype html>
       });
     }
     $('lightbox-close').addEventListener('click', closeFigure);
+    $('lightbox-prev').addEventListener('click', () => showFigure(lightboxIndex - 1));
+    $('lightbox-next').addEventListener('click', () => showFigure(lightboxIndex + 1));
     $('lightbox').addEventListener('click', event => { if (event.target === $('lightbox')) closeFigure(); });
     $('transaction-detail-close').addEventListener('click', closeTransaction);
     $('transaction-detail').addEventListener('click', event => { if (event.target === $('transaction-detail')) closeTransaction(); });
-    document.addEventListener('keydown', event => { if (event.key !== 'Escape') return; if ($('lightbox').classList.contains('is-open')) closeFigure(); if ($('transaction-detail').classList.contains('is-open')) closeTransaction(); });
+    document.addEventListener('keydown', event => {
+      const lightboxOpen = $('lightbox').classList.contains('is-open');
+      if (lightboxOpen && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
+        event.preventDefault();
+        showFigure(lightboxIndex + (event.key === 'ArrowRight' ? 1 : -1));
+        return;
+      }
+      if (event.key !== 'Escape') return;
+      if (lightboxOpen) closeFigure();
+      if ($('transaction-detail').classList.contains('is-open')) closeTransaction();
+    });
     $('suspicious-search').addEventListener('input', () => renderSuspicious(suspiciousRows));
     $('risk-filter').addEventListener('change', () => renderSuspicious(suspiciousRows));
     function render(data) {
@@ -361,10 +494,12 @@ PAGE = r'''<!doctype html>
       $('models').innerHTML = (data.models || []).map(model => `<tr class="${model.slug === selection.recommended_model ? 'selected' : ''}">${cell(safe(modelLabel(model.slug)))}${cell(safe(methodLabel(model.imbalance_method)))}${cell(Number(model.pr_auc || 0).toFixed(4), 'num')}${cell(percent(model.precision), 'num')}${cell(percent(model.recall), 'num')}${cell(percent(model.f1), 'num')}</tr>`).join('');
       const prediction = data.prediction || {};
       renderPrediction(prediction);
+      renderFlinkAlerts(data.flink_alerts || {});
+      renderMLAlerts(data.ml_alerts || {});
       renderSuspicious(data.suspicious);
       $('figures').innerHTML = (data.figures || []).map((name, index) => { const info = figureInfo[name] || [name, '']; const chartNumber = String(index + 1).padStart(2, '0'); return `<figure tabindex="0" role="button" aria-label="Nhấn để phóng to biểu đồ ${chartNumber}"><figcaption><div class="figure-copy"><span class="figure-title">${safe(info[0])}</span><small>${safe(info[1])}</small></div><span class="figure-index">#${chartNumber}</span></figcaption><img loading="lazy" src="/figures/${encodeURIComponent(name)}" alt="${safe(info[0])}"></figure>`; }).join('');
       bindFigureInteractions();
-      $('status').textContent = `Đã cập nhật ${safe(data.updated_at)} · tự làm mới mỗi 10 giây`;
+      $('status').textContent = `Đã cập nhật ${safe(data.updated_at)} · tự làm mới mỗi 5 giây`;
       $('status').className = 'status ok';
     }
     async function uploadPrediction(event) {
@@ -374,6 +509,7 @@ PAGE = r'''<!doctype html>
       const form = new FormData();
       form.append('file', file);
       $('upload-submit').disabled = true;
+      $('upload-results').hidden = true;
       $('upload-status').textContent = 'Đang chạy model trên file CSV...';
       $('upload-status').className = 'upload-status';
       try {
@@ -381,6 +517,7 @@ PAGE = r'''<!doctype html>
         const result = await response.json();
         if (!response.ok || !result.ok) throw new Error(result.error || `HTTP ${response.status}`);
         renderPrediction(result.prediction || {});
+        renderUploadFlagged(result.prediction || {});
         $('upload-status').textContent = `Đã dự đoán ${number(result.prediction.input_rows)} giao dịch từ ${result.filename} · gắn cờ ${number(result.prediction.flagged_rows)} giao dịch.`;
         $('upload-status').className = 'upload-status success';
       } catch (error) {
@@ -398,7 +535,7 @@ PAGE = r'''<!doctype html>
     }
     $('refresh').addEventListener('click', load);
     load();
-    setInterval(load, 10000);
+    setInterval(load, 5000);
   </script>
 </body>
 </html>'''
@@ -421,6 +558,113 @@ PREDICTION_TEMPLATE = (
 PREDICT_LOCK = threading.Lock()
 
 
+class KafkaAlertFeed:
+    def __init__(
+        self,
+        topic_env: str,
+        default_topic: str,
+        group_id: str,
+        threshold_env: str | None = None,
+        model_path_env: str | None = None,
+    ) -> None:
+        self.topic_env = topic_env
+        self.default_topic = default_topic
+        self.group_id = group_id
+        self.threshold_env = threshold_env
+        self.model_path = (
+            Path(os.getenv(model_path_env, "/workspace/output/models/isolation_forest.joblib"))
+            if model_path_env
+            else None
+        )
+        self._alerts: deque[dict] = deque(maxlen=100)
+        self._connected = False
+        self._last_message_at = ""
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._consume, name=f"{self.group_id}-feed", daemon=True)
+            self._thread.start()
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            alerts = list(self._alerts)
+            snapshot = {
+                "connected": self._connected,
+                "topic": os.getenv(self.topic_env, self.default_topic),
+                "total_alerts": len(alerts),
+                "alerts": alerts,
+                "last_message_at": self._last_message_at,
+            }
+            if self.threshold_env:
+                snapshot["threshold"] = float(os.getenv(self.threshold_env, "1000"))
+            if self.model_path:
+                snapshot["model_ready"] = self.model_path.is_file()
+                snapshot["score_threshold"] = float(os.getenv("ML_ANOMALY_SCORE_MIN", "0.05"))
+            return snapshot
+
+    def _consume(self) -> None:
+        from confluent_kafka import Consumer, KafkaException
+
+        config = {
+            "bootstrap.servers": os.getenv("KAFKA_BOOTSTRAP_SERVERS", "stream-kafka:19092"),
+            "group.id": self.group_id,
+            "auto.offset.reset": "earliest",
+            "enable.auto.commit": True,
+            "session.timeout.ms": 10000,
+            "heartbeat.interval.ms": 3000,
+        }
+        topic = os.getenv(self.topic_env, self.default_topic)
+
+        while not self._stop.is_set():
+            consumer = Consumer(config)
+            try:
+                consumer.list_topics(timeout=4)
+                consumer.subscribe([topic])
+                with self._lock:
+                    self._connected = True
+                print(f"[dashboard] reading Kafka alerts from {topic}", flush=True)
+
+                while not self._stop.is_set():
+                    message = consumer.poll(1.0)
+                    if message is None:
+                        continue
+                    if message.error():
+                        raise KafkaException(message.error())
+                    try:
+                        alert = json.loads(message.value().decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+                        continue
+                    if not isinstance(alert, dict):
+                        continue
+                    with self._lock:
+                        self._alerts.appendleft(alert)
+                        self._last_message_at = datetime.now().astimezone().isoformat(timespec="seconds")
+            except KafkaException as error:
+                with self._lock:
+                    self._connected = False
+                print(f"[dashboard] waiting for Kafka: {error}", flush=True)
+                self._stop.wait(3)
+            finally:
+                consumer.close()
+
+
+FLINK_ALERT_FEED = KafkaAlertFeed(
+    "FLINK_ALERTS_TOPIC",
+    "flink-alerts",
+    "fraud-detection-dashboard-flink-alerts",
+    threshold_env="FLINK_HIGH_AMOUNT_THRESHOLD",
+)
+ML_ALERT_FEED = KafkaAlertFeed(
+    "ML_ALERTS_TOPIC",
+    "flink-ml-alerts",
+    "fraud-detection-dashboard-ml-alerts",
+    model_path_env="ISOLATION_MODEL_PATH",
+)
+
+
 def read_json(path: Path) -> dict:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -432,6 +676,18 @@ def read_csv(path: Path, limit: int = 20) -> list[dict]:
     try:
         with path.open("r", encoding="utf-8", newline="") as handle:
             return list(__import__("itertools").islice(csv.DictReader(handle), limit))
+    except (FileNotFoundError, OSError):
+        return []
+
+
+def read_flagged_csv(path: Path) -> list[dict]:
+    try:
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            return [
+                row
+                for row in csv.DictReader(handle)
+                if row.get("status") == "NEEDS_REVIEW" or row.get("prediction") == "1"
+            ]
     except (FileNotFoundError, OSError):
         return []
 
@@ -523,6 +779,7 @@ def run_uploaded_prediction(payload: bytes) -> dict:
             "prediction": {
                 **report,
                 "rows": read_csv(csv_path, limit=100),
+                "flagged_transactions": read_flagged_csv(csv_path),
             }
         }
     finally:
@@ -558,6 +815,8 @@ def dashboard_data(output_dir: Path) -> dict:
         "models": phase4.get("model_comparison", []),
         "prediction": {**prediction, "rows": read_csv(results / "new_transactions_predictions.csv")},
         "suspicious": read_csv(results / "top_suspicious_transactions.csv"),
+        "flink_alerts": FLINK_ALERT_FEED.snapshot(),
+        "ml_alerts": ML_ALERT_FEED.snapshot(),
         "figures": figures,
     }
 
@@ -630,6 +889,8 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=Path("output"))
     args = parser.parse_args()
     DashboardHandler.output_dir = args.output
+    FLINK_ALERT_FEED.start()
+    ML_ALERT_FEED.start()
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
     print(f"[dashboard] listening on http://{args.host}:{args.port}", flush=True)
     server.serve_forever()

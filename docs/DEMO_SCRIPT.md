@@ -35,7 +35,7 @@ Thông điệp: chỉ khoảng 0,15% giao dịch là Fraud, nên Accuracy có th
 
 ### 2:30–4:00 — Feature engineering và training
 
-1. Trình bày split Train/Test bằng hash với seed 42.
+1. Trình bày split Train/Validation/Test bằng hash với seed 42.
 2. Nhấn mạnh preprocessor chỉ fit trên Train.
 3. Chỉ ra `Class` và các ID không có trong 277 features.
 4. Nêu ba thí nghiệm imbalance: None, Class Weight và Undersampling.
@@ -47,7 +47,7 @@ Thông điệp: chỉ khoảng 0,15% giao dịch là Fraud, nên Accuracy có th
 3. So sánh LR Class Weight với RF None/RF Undersampling.
 4. Hiển thị threshold table.
 
-Thông điệp: Class Weight tăng Recall nhưng làm tăng False Positive; không chọn threshold nếu chưa có chi phí nghiệp vụ.
+Thông điệp: Class Weight tăng Recall nhưng làm tăng False Positive; threshold kỹ thuật được chọn trên Validation, còn threshold production cần chi phí nghiệp vụ.
 
 ### 6:30–8:00 — Suspicious transactions
 

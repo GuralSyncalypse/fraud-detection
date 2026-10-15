@@ -34,7 +34,7 @@ from feature_engineering import extract_feature_names
 
 
 DEFAULT_TEST = "hdfs:///financial/processed/ml_splits/test"
-DEFAULT_LABELED = "hdfs:///financial/processed/labeled_transactions"
+DEFAULT_VALIDATION = "hdfs:///financial/processed/ml_splits/validation"
 DEFAULT_MODEL_BASE = "hdfs:///financial/models"
 DEFAULT_PREDICTION_BASE = "hdfs:///financial/predictions"
 DEFAULT_REPORT = "/workspace/output/results/phase4_summary.json"
@@ -179,10 +179,45 @@ def evaluate_scored_frame(
     return metrics, threshold_rows
 
 
+def score_classifier(
+    model: Any, features: DataFrame, threshold: float
+) -> DataFrame:
+    return (
+        model.transform(features)
+        .withColumn("fraud_probability", vector_to_array("probability")[1])
+        .withColumn(
+            "prediction",
+            (F.col("fraud_probability") >= F.lit(float(threshold))).cast("int"),
+        )
+        .select(
+            "transaction_id",
+            "transaction_time",
+            "amount",
+            "class",
+            "fraud_probability",
+            "prediction",
+        )
+    )
+
+
+def select_threshold(threshold_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if not threshold_rows:
+        raise ValueError("At least one threshold is required for model selection")
+    return max(
+        threshold_rows,
+        key=lambda row: (
+            float(row["f1"]),
+            float(row["precision"]),
+            float(row["recall"]),
+            float(row["threshold"]),
+        ),
+    )
+
+
 def run_phase4(
     spark: SparkSession,
     test_path: str,
-    labeled_path: str,
+    validation_path: str,
     model_base: str,
     prediction_base: str,
     report_path: str,
@@ -192,46 +227,72 @@ def run_phase4(
 ) -> dict[str, Any]:
     print(f"[phase4] Reading untouched test split from {test_path}")
     test = spark.read.parquet(test_path)
-    transaction_times = spark.read.parquet(labeled_path).select(
-        "transaction_id", "transaction_time"
-    )
-    enriched_test = test.join(transaction_times, "transaction_id", "left")
+    validation = spark.read.parquet(validation_path)
     preprocessor = PipelineModel.load(f"{model_base}/preprocessor")
-    test_features = preprocessor.transform(enriched_test).persist(StorageLevel.DISK_ONLY)
+    validation_features = preprocessor.transform(validation).persist(
+        StorageLevel.DISK_ONLY
+    )
+    validation_count = validation_features.count()
+    test_features = preprocessor.transform(test).persist(StorageLevel.DISK_ONLY)
     test_count = test_features.count()
-    missing_time_count = test_features.where(F.col("transaction_time").isNull()).count()
+    missing_time_count = (
+        validation_features.where(F.col("transaction_time").isNull()).count()
+        + test_features.where(F.col("transaction_time").isNull()).count()
+    )
     if missing_time_count:
         raise RuntimeError(
-            f"{missing_time_count} test rows are missing transaction_time after join"
+            f"{missing_time_count} validation/test rows are missing transaction_time"
         )
-    print(f"[phase4] Test rows={test_count:,}; preprocessing model loaded from HDFS")
+    print(
+        f"[phase4] Validation rows={validation_count:,}; "
+        f"test rows={test_count:,}; preprocessing model loaded from HDFS"
+    )
 
     model_results: list[dict[str, Any]] = []
     threshold_results: list[dict[str, Any]] = []
     feature_importance_rows: list[dict[str, Any]] = []
+    selection_results: list[dict[str, Any]] = []
     prediction_paths: dict[str, str] = {}
     feature_names = extract_feature_names(test_features)
 
     for slug, model_name, imbalance_method, relative_path, loader in SPARK_MODEL_SPECS:
-        print(f"[phase4] Evaluating {slug} on the full test set")
+        print(f"[phase4] Selecting threshold for {slug} on validation set")
         model = loader.load(f"{model_base}/{relative_path}")
-        predictions = (
-            model.transform(test_features)
-            .withColumn("fraud_probability", vector_to_array("probability")[1])
-            .withColumn(
-                "prediction",
-                (F.col("fraud_probability") >= F.lit(0.5)).cast("int"),
-            )
-            .select(
-                "transaction_id",
-                "transaction_time",
-                "amount",
-                "class",
-                "fraud_probability",
-                "prediction",
-            )
-            .persist(StorageLevel.DISK_ONLY)
+        validation_predictions = score_classifier(
+            model, validation_features, threshold=0.5
+        ).persist(StorageLevel.DISK_ONLY)
+        validation_predictions.count()
+        validation_metrics = binary_metrics(validation_predictions)
+        validation_pr_auc = area_under_pr(
+            validation_predictions, score_col="fraud_probability"
         )
+        validation_thresholds = threshold_analysis(
+            validation_predictions,
+            score_col="fraud_probability",
+            thresholds=thresholds,
+        )
+        selected_threshold = select_threshold(validation_thresholds)
+        selection_results.append(
+            {
+                "slug": slug,
+                "model": model_name,
+                "threshold": float(selected_threshold["threshold"]),
+                "validation_pr_auc": validation_pr_auc,
+                "validation_f1": float(selected_threshold["f1"]),
+                "validation_precision": float(selected_threshold["precision"]),
+                "validation_recall": float(selected_threshold["recall"]),
+                "validation_rows": validation_metrics["evaluation_rows"],
+            }
+        )
+        validation_predictions.unpersist()
+
+        print(
+            f"[phase4] Evaluating {slug} on test at threshold "
+            f"{selected_threshold['threshold']:.3f}"
+        )
+        predictions = score_classifier(
+            model, test_features, threshold=float(selected_threshold["threshold"])
+        ).persist(StorageLevel.DISK_ONLY)
         if predictions.count() != test_count:
             raise RuntimeError(f"Prediction row count mismatch for {slug}")
 
@@ -245,7 +306,9 @@ def run_phase4(
             "slug": slug,
             "model": model_name,
             "imbalance_method": imbalance_method,
-            "decision_threshold": 0.5,
+            "decision_threshold": float(selected_threshold["threshold"]),
+            "validation_pr_auc": validation_pr_auc,
+            "validation_f1": float(selected_threshold["f1"]),
             **metrics,
         }
         model_results.append(result)
@@ -366,7 +429,7 @@ def run_phase4(
             "rows": test_count,
             "test_was_sampled": False,
             "same_test_rows_for_all_models": True,
-            "default_classifier_threshold": 0.5,
+            "threshold_selected_on_validation": True,
         },
         "model_comparison": model_results,
         "threshold_analysis": threshold_results,
@@ -385,8 +448,27 @@ def run_phase4(
             "Isolation Forest never uses class as an input feature; class is used only after scoring for evaluation.",
         ],
     }
+    recommended = max(
+        selection_results,
+        key=lambda row: (
+            float(row["validation_pr_auc"]),
+            float(row["validation_f1"]),
+            float(row["validation_precision"]),
+        ),
+    )
+    report["selection"] = {
+        "recommended_model": recommended["slug"],
+        "recommended_threshold": recommended["threshold"],
+        "thresholds_by_model": {
+            row["slug"]: row["threshold"] for row in selection_results
+        },
+        "criterion": "validation PR-AUC, then validation F1",
+        "validation_results": selection_results,
+        "note": "Technical recommendation only; business review cost is still required.",
+    }
+    report["evaluation_scope"]["validation_path"] = validation_path
+    report["evaluation_scope"]["validation_rows"] = validation_count
     write_json_atomic(report, report_path)
-
     metadata_files = [
         report_path,
         comparison_path,
@@ -401,7 +483,12 @@ def run_phase4(
             local_path,
             f"{prediction_base}/metadata/{Path(local_path).name}",
         )
-
+    copy_local_file_to_hdfs(
+        spark,
+        report_path,
+        f"{model_base}/metadata/phase4_summary.json",
+    )
+    validation_features.unpersist()
     test_features.unpersist()
     print(json.dumps(report, indent=2))
     print(f"[phase4] PASS report={report_path}")
@@ -411,7 +498,7 @@ def run_phase4(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--test", default=DEFAULT_TEST)
-    parser.add_argument("--labeled", default=DEFAULT_LABELED)
+    parser.add_argument("--validation", default=DEFAULT_VALIDATION)
     parser.add_argument("--model-base", default=DEFAULT_MODEL_BASE)
     parser.add_argument("--prediction-base", default=DEFAULT_PREDICTION_BASE)
     parser.add_argument("--report", default=DEFAULT_REPORT)
@@ -434,7 +521,7 @@ def main() -> None:
         run_phase4(
             spark=spark,
             test_path=args.test,
-            labeled_path=args.labeled,
+            validation_path=args.validation,
             model_base=args.model_base,
             prediction_base=args.prediction_base,
             report_path=args.report,

@@ -31,15 +31,29 @@ NUMERIC_FEATURES = [
 CATEGORICAL_FEATURES = ["use_chip", "mcc_category", "merchant_state_category"]
 
 
+def _blank_or_null(column_name: str) -> Any:
+    column = F.col(column_name)
+    return column.isNull() | (F.trim(column.cast("string")) == "")
+
+
 def _derived_feature_columns() -> list[Any]:
     """Return the shared, stateless columns used by training and inference."""
+    use_chip = F.when(_blank_or_null("use_chip"), F.lit("Unknown")).otherwise(
+        F.trim(F.col("use_chip"))
+    )
+    merchant_state = F.when(
+        _blank_or_null("merchant_state"), F.lit(None).cast("string")
+    ).otherwise(F.trim(F.col("merchant_state")))
+    errors = F.when(
+        _blank_or_null("errors"), F.lit(None).cast("string")
+    ).otherwise(F.trim(F.col("errors")))
     return [
         F.col("amount").cast("double").alias("amount"),
-        F.coalesce(F.col("use_chip"), F.lit("Unknown")).alias("use_chip"),
+        use_chip.alias("use_chip"),
         F.coalesce(F.col("mcc").cast("string"), F.lit("Unknown")).alias(
             "mcc_category"
         ),
-        F.coalesce(F.col("merchant_state"), F.lit("ONLINE_OR_UNKNOWN")).alias(
+        F.coalesce(merchant_state, F.lit("ONLINE_OR_UNKNOWN")).alias(
             "merchant_state_category"
         ),
         F.hour("transaction_time").cast("double").alias("transaction_hour"),
@@ -51,10 +65,10 @@ def _derived_feature_columns() -> list[Any]:
         F.when(F.dayofweek("transaction_time").isin(1, 7), 1.0)
         .otherwise(0.0)
         .alias("is_weekend"),
-        F.when(F.col("merchant_state").isNull(), 1.0)
+        F.when(merchant_state.isNull(), 1.0)
         .otherwise(0.0)
         .alias("is_online"),
-        F.when(F.col("errors").isNotNull(), 1.0)
+        F.when(errors.isNotNull(), 1.0)
         .otherwise(0.0)
         .alias("has_error"),
     ]
@@ -70,7 +84,7 @@ def prepare_inference_features(transactions: DataFrame) -> DataFrame:
 def prepare_base_features(transactions: DataFrame) -> DataFrame:
     """Derive labeled model inputs without using the label as a feature."""
     return transactions.select(
-        "transaction_id", "class", *_derived_feature_columns()
+        "transaction_id", "transaction_time", "class", *_derived_feature_columns()
     )
 
 
@@ -102,7 +116,9 @@ def deterministic_cap(
     seed: int = RANDOM_SEED + 1,
 ) -> DataFrame:
     """Apply a class-neutral compute cap while preserving the natural distribution."""
-    if target_rows <= 0 or total_count <= target_rows:
+    if total_count < 0 or target_rows <= 0:
+        raise ValueError("total_count must be non-negative and target_rows positive")
+    if total_count == 0 or total_count <= target_rows:
         return data
 
     threshold = max(1, min(HASH_BUCKETS, int(HASH_BUCKETS * target_rows / total_count)))
@@ -120,8 +136,10 @@ def deterministic_undersample(
     seed: int = RANDOM_SEED + 2,
 ) -> DataFrame:
     """Keep all fraud and reduce only normal rows in the training set."""
-    if fraud_count <= 0:
-        raise ValueError("Training data contains no fraud rows")
+    if fraud_count <= 0 or normal_count <= 0:
+        raise ValueError("Training data must contain fraud and normal rows")
+    if normal_to_fraud_ratio <= 0:
+        raise ValueError("normal_to_fraud_ratio must be positive")
 
     desired_normal = min(normal_count, int(fraud_count * normal_to_fraud_ratio))
     threshold = max(
@@ -174,6 +192,8 @@ def fit_preprocessor(train: DataFrame) -> PipelineModel:
 def class_distribution(data: DataFrame) -> dict[str, Any]:
     rows = data.groupBy("class").count().orderBy("class").collect()
     total = sum(int(row["count"]) for row in rows)
+    if total == 0:
+        raise ValueError("Cannot calculate class distribution for empty data")
     return {
         "total": total,
         "classes": {
